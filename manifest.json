@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.luiscf1226.ram-kill",
+  "name": "RAM Kill",
+  "version": "1.0.0",
+  "author": "luiscf1226",
+  "license": "MIT",
+  "description": "RAM in the bar. Click for a simple panel: every Claude session on its own row (select several and kill them together) plus your biggest apps.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "RAM Kill",
+    "description": "RAM in use. Click to see and kill Claude sessions and the biggest apps.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

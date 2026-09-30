@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""Free RAM: pick an app from a menu (biggest first) and kill it.
+
+Usage: ram-kill [menu|list|status|json|kill PID...]
+  menu    pick an app to kill (default)
+  list    print apps and their memory, biggest first
+  status  print "used total" RAM in GiB (for the bar widget)
+  json    RAM, Claude sessions and top apps as JSON (for the bar popup)
+  kill    kill the given PIDs and everything they spawned
+
+Only your own apps launched in the desktop (systemd app.slice) are listed.
+Session and system services (Hyprland, the Omarchy shell, audio, portals,
+input method, keyring, dbus, ...) live elsewhere or are on the protected
+list below, so they never show up and can't be killed from here.
+Memory is PSS (shared pages split fairly), grouped by executable, so all
+of Chromium's processes count as one "Chromium".
+"""
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+MIN_MB = 50
+
+# Executable/command names that must never be killed.
+PROTECTED = {
+    "Hyprland", "hyprland", "Xwayland", "quickshell", "qs", "omarchy-shell",
+    "hypridle", "hyprlock", "hyprsunset", "hyprpaper", "swaybg", "swayosd-server",
+    "mako", "walker", "elephant", "uwsm", "uwsm-app",
+    "systemd", "dbus-daemon", "dbus-broker", "dbus-broker-launch",
+    "pipewire", "pipewire-pulse", "wireplumber",
+    "fcitx5", "ibus-daemon",
+    "gnome-keyring-daemon", "ssh-agent", "gpg-agent", "keyboxd", "dconf-service",
+    "polkit-gnome-authentication-agent-1", "hyprpolkitagent", "bt-agent",
+    "xdg-desktop-portal", "xdg-desktop-portal-hyprland", "xdg-desktop-portal-gtk",
+    "xdg-document-portal", "xdg-permission-store", "at-spi-bus-launcher",
+    "at-spi2-registryd", "gvfsd", "udiskie", "voxtype", "voxtype-osd-gtk",
+    "sudo", "pkexec", "login", "sshd",
+    "bash", "zsh", "fish", "sh", "dash", "python3", "ram-kill",
+}
+PROTECTED_PREFIXES = ("omarchy-", "xdg-", "gvfs", "at-spi", "hypr", "pipewire", "systemd")
+
+NICE_NAMES = {"zen-bin": "Zen Browser", "chromium": "Chromium", "t3code": "T3 Code"}
+
+
+def read(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def pss_kb(pid):
+    for line in read(f"/proc/{pid}/smaps_rollup").splitlines():
+        if line.startswith("Pss:"):
+            return int(line.split()[1])
+    return 0
+
+
+def is_protected(name):
+    return name in PROTECTED or name.startswith(PROTECTED_PREFIXES)
+
+
+def own_ancestors():
+    pids, pid = set(), os.getpid()
+    while pid > 1:
+        pids.add(pid)
+        stat = read(f"/proc/{pid}/stat")
+        if not stat:
+            break
+        pid = int(stat.rsplit(")", 1)[1].split()[1])
+    return pids
+
+
+def apps():
+    uid, skip = os.getuid(), own_ancestors()
+    groups = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != uid or pid in skip:
+                continue
+            exe = os.readlink(f"/proc/{pid}/exe")
+        except OSError:
+            continue
+        cgroup = read(f"/proc/{pid}/cgroup")
+        if "/app.slice/" not in cgroup:
+            continue  # session/background services, login scope, etc.
+        exe = exe.removesuffix(" (deleted)")
+        name = os.path.basename(exe)
+        comm = read(f"/proc/{pid}/comm").strip()
+        g = groups.setdefault(exe, {"name": name, "pids": [], "kb": 0, "protected": False})
+        g["pids"].append(pid)
+        g["kb"] += pss_kb(pid)
+        if is_protected(name) or is_protected(comm):
+            g["protected"] = True
+    result = [g for g in groups.values() if not g["protected"] and g["kb"] >= MIN_MB * 1024]
+    return sorted(result, key=lambda g: g["kb"], reverse=True)
+
+
+def gb(kb):
+    return f"{kb / 1048576:.2f} GB" if kb >= 1048576 else f"{kb / 1024:.0f} MB"
+
+
+def label(g):
+    return NICE_NAMES.get(g["name"], g["name"])
+
+
+def notify(msg):
+    subprocess.run(["notify-send", "-a", "RAM", "RAM", msg], stderr=subprocess.DEVNULL)
+
+
+def kill(g):
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        alive = []
+        for pid in g["pids"]:
+            try:
+                os.kill(pid, sig)
+                alive.append(pid)
+            except ProcessLookupError:
+                pass
+        if not alive or sig == signal.SIGKILL:
+            break
+        for _ in range(30):  # give it up to 3s to exit cleanly
+            time.sleep(0.1)
+            g["pids"] = [p for p in alive if os.path.exists(f"/proc/{p}")]
+            if not g["pids"]:
+                break
+        if not g["pids"]:
+            break
+
+
+def meminfo():
+    info = {}
+    for line in read("/proc/meminfo").splitlines():
+        key, value = line.split(":", 1)
+        info[key] = int(value.split()[0])
+    total = info["MemTotal"]
+    return total - info["MemAvailable"], total
+
+
+def status():
+    used, total = meminfo()
+    print(f"{used / 1048576:.1f} {total / 1048576:.1f}")
+
+
+def ppid_of(pid):
+    stat = read(f"/proc/{pid}/stat")
+    return int(stat.rsplit(")", 1)[1].split()[1]) if stat else 0
+
+
+def children_map():
+    kids = {}
+    for entry in os.listdir("/proc"):
+        if entry.isdigit():
+            kids.setdefault(ppid_of(int(entry)), []).append(int(entry))
+    return kids
+
+
+def tree(pid, kids):
+    out, stack = [], [pid]
+    while stack:
+        p = stack.pop()
+        out.append(p)
+        stack.extend(kids.get(p, []))
+    return out
+
+
+def age(pid):
+    try:
+        ticks = int(read(f"/proc/{pid}/stat").rsplit(")", 1)[1].split()[19])
+        secs = float(read("/proc/uptime").split()[0]) - ticks / os.sysconf("SC_CLK_TCK")
+    except (ValueError, IndexError):
+        return ""
+    if secs < 3600:
+        return f"{int(secs // 60)}m"
+    if secs < 86400:
+        return f"{int(secs // 3600)}h {int(secs % 3600 // 60)}m"
+    return f"{int(secs // 86400)}d"
+
+
+def is_claude(pid):
+    try:
+        exe = os.path.basename(os.readlink(f"/proc/{pid}/exe").removesuffix(" (deleted)"))
+    except OSError:
+        return False
+    return exe == "claude" or read(f"/proc/{pid}/comm").strip() == "claude"
+
+
+def claude_sessions():
+    uid, kids = os.getuid(), children_map()
+    found = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != uid or not is_claude(pid):
+                continue
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            continue
+        if is_claude(ppid_of(pid)):
+            continue  # a subprocess of another session, counted with its parent
+        parent = read(f"/proc/{ppid_of(pid)}/comm").strip()
+        tty = os.path.exists(f"/proc/{pid}/fd/0") and os.path.realpath(f"/proc/{pid}/fd/0")
+        where = tty.removeprefix("/dev/") if tty and tty.startswith("/dev/pts") else NICE_NAMES.get(parent, parent)
+        kb = sum(pss_kb(p) for p in tree(pid, kids))
+        home = os.path.expanduser("~")
+        found.append({
+            "pid": pid,
+            "project": os.path.basename(cwd) or cwd,
+            "cwd": cwd.replace(home, "~", 1),
+            "where": where,
+            "age": age(pid),
+            "mb": round(kb / 1024),
+        })
+    return sorted(found, key=lambda s: s["mb"], reverse=True)
+
+
+def as_json():
+    used, total = meminfo()
+    top = [g for g in apps() if g["name"] != "claude"][:8]
+    print(json.dumps({
+        "used": round(used / 1048576, 2),
+        "total": round(total / 1048576, 2),
+        "claude": claude_sessions(),
+        "apps": [{"name": label(g), "mb": round(g["kb"] / 1024), "count": len(g["pids"]), "pids": g["pids"]} for g in top],
+    }))
+
+
+def kill_pids(pids):
+    uid, kids = os.getuid(), children_map()
+    targets = []
+    for pid in pids:
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != uid:
+                continue
+        except OSError:
+            continue
+        name = read(f"/proc/{pid}/comm").strip()
+        if pid <= 1 or is_protected(name):
+            continue
+        targets.extend(tree(pid, kids))
+    kill({"pids": list(dict.fromkeys(targets))})
+
+
+def menu():
+    found = apps()
+    if not found:
+        notify("Nothing big enough to kill")
+        return
+    options = [f"󰍛\t{label(g)}\t{gb(g['kb'])} · {len(g['pids'])} process(es)" for g in found]
+    res = subprocess.run(["omarchy-menu-select", "Kill (by RAM)", *options, "--", "--width", "500"],
+                         capture_output=True, text=True)
+    if res.returncode != 0 or not res.stdout.strip():
+        return
+    chosen = res.stdout.strip().split("\t")[0]
+    for g in found:
+        if label(g) == chosen:
+            kill(g)
+            notify(f"Killed {chosen}, freed ~{gb(g['kb'])}")
+            return
+
+
+cmd = sys.argv[1] if len(sys.argv) > 1 else "menu"
+if cmd == "status":
+    status()
+elif cmd == "list":
+    for g in apps():
+        print(f"{gb(g['kb']):>10}  {label(g)}  ({len(g['pids'])} procs)")
+elif cmd == "json":
+    as_json()
+elif cmd == "kill":
+    kill_pids([int(a) for a in sys.argv[2:] if a.isdigit()])
+elif cmd == "menu":
+    menu()
+else:
+    print(__doc__.strip())
